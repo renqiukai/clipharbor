@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import ApplicationServices
+import ServiceManagement
 
 @MainActor
 final class ClipboardStore: ObservableObject {
@@ -141,6 +142,7 @@ struct HistoryView: View {
     var select: (Clip) -> Void
     @State private var search = ""
     @State private var showFrequent = false
+    @State private var loginStatus = SMAppService.mainApp.status
     @AppStorage("shortcut") private var shortcut = "optionShiftV"
 
     private var items: [Clip] {
@@ -216,6 +218,23 @@ struct HistoryView: View {
             HStack {
                 Button("微信聊天转上下文") { convert() }
                 Spacer()
+                Button(loginStatus == .enabled ? "✓ 登录时启动" : (loginStatus == .requiresApproval ? "取消启动（待授权）" : "登录时启动")) {
+                    do {
+                        loginStatus = SMAppService.mainApp.status
+                        if loginStatus == .enabled || loginStatus == .requiresApproval {
+                            try SMAppService.mainApp.unregister()
+                        } else {
+                            try SMAppService.mainApp.register()
+                        }
+                        loginStatus = SMAppService.mainApp.status
+                        if loginStatus == .requiresApproval {
+                            store.error = "请在系统设置 → 通用 → 登录项与扩展中允许 ClipHarbor。"
+                        }
+                    } catch {
+                        loginStatus = SMAppService.mainApp.status
+                        store.error = "无法更改登录时启动：\(error.localizedDescription)"
+                    }
+                }
             }.padding(.horizontal, 12).padding(.top, 8)
             HStack {
                 Button("清空未置顶") { store.clear() }.disabled(store.history.items.count == store.history.pinned.count)
@@ -231,6 +250,7 @@ struct HistoryView: View {
             }.padding(12)
         }
         .frame(width: 340, height: 400)
+        .onAppear { loginStatus = SMAppService.mainApp.status }
         .alert("剪贴板历史", isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) {
             Button("好") { store.error = nil }
         } message: { Text(store.error ?? "") }

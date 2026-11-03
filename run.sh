@@ -17,4 +17,5 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
+codesign --force --sign - "$APP"
 open "$APP"
