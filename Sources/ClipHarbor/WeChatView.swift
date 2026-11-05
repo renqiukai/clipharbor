@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 
+@MainActor
 struct WeChatView: View {
     @State private var clipboardText: String?
     @State private var clipboardMetadata: Data?
@@ -9,6 +10,9 @@ struct WeChatView: View {
     @State private var result: WeChatExport.Result?
     @State private var error: String?
     @State private var working = false
+    @State private var exportTask: Task<WeChatExport.Result, Error>?
+    @State private var scanned = 0
+    @State private var status = ""
 
     private static var defaultSource: URL? {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files", isDirectory: true)
@@ -22,7 +26,7 @@ struct WeChatView: View {
             Text("在微信中选中多条聊天并复制，点击自动转换。转换和图片搜索都在本机进行。")
                 .foregroundStyle(.secondary)
             HStack {
-                Button("读取并诊断剪贴板") { readClipboard() }
+                Button("读取并诊断剪贴板") { readClipboard() }.disabled(working)
                 ScrollView {
                     Text(diagnostic).font(.caption).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -33,16 +37,22 @@ struct WeChatView: View {
                 Button("更换图片搜索目录…") { chooseSource() }
                 Text(source?.path ?? "未选择；图片会标记为未匹配").lineLimit(2).font(.caption)
                 if source != nil { Button("移除") { source = nil } }
-            }
+            }.disabled(working)
             Text("优先根据微信复制数据关联图片，其次匹配唯一同名文件；不按时间猜测，无法确认的图片会列入报告。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button("自动转换并保存") { export() }.disabled(working)
-                if working { ProgressView().controlSize(.small); Text("正在搜索和导出…") }
+                if working {
+                    ProgressView().controlSize(.small)
+                    Text("已扫描 \(scanned) 个项目")
+                    Button("取消") { exportTask?.cancel(); status = "正在取消…" }
+                }
             }
+            if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
             if let result {
                 Text("已导出 \(result.messages) 条消息；图片引用匹配 \(result.matched) 项，未匹配 \(result.unmatched) 项。")
                 Text(result.directory.path).font(.caption).textSelection(.enabled)
+                ForEach(result.warnings, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
                 Button("在访达中显示结果") { NSWorkspace.shared.activateFileViewerSelecting([result.directory]) }
                 Text("将 conversation.md 的内容和 images 文件夹中的图片分别提供给 ChatGPT，并按关联报告检查顺序。")
                     .font(.caption).foregroundStyle(.secondary)
@@ -52,6 +62,7 @@ struct WeChatView: View {
         }
         .frame(width: 560, height: 380)
         .onAppear { readClipboard() }
+        .onDisappear { exportTask?.cancel() }
         .alert("微信聊天转上下文", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("好") { error = nil }
         } message: { Text(error ?? "") }
@@ -74,8 +85,9 @@ struct WeChatView: View {
         let text = board.string(forType: .string)
         clipboardMetadata = board.data(forType: NSPasteboard.PasteboardType("com.trolltech.anymime.x-xwechat-multiselect-copy"))
         clipboardText = text.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-        let parsed = clipboardText.map(WeChatExport.parse)
+        let parsed = clipboardText.map { WeChatExport.parse($0, clipboardMetadata: clipboardMetadata) }
         diagnostic = "格式：\(types.isEmpty ? "无" : types.joined(separator: ", "))\n\(itemTypes)\n文本：\(clipboardText == nil ? "无" : "有")；识别消息：\(parsed?.messages.count ?? 0)；图片引用：\(clipboardText.map { WeChatExport.references(in: $0).count } ?? 0)"
+        if let warning = parsed?.warning { diagnostic += "\n" + warning }
     }
 
     private func chooseSource() {
@@ -99,16 +111,26 @@ struct WeChatView: View {
         let metadata = clipboardMetadata
         result = nil
         working = true
+        scanned = 0
+        status = "正在搜索和导出…"
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            return try WeChatExport.export(text: text, source: selectedSource, destination: destination, clipboardMetadata: metadata,
+                                           progress: { count in Task { @MainActor in scanned = count } })
+        }
+        exportTask = task
         Task {
             do {
-                let output = try await Task.detached {
-                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-                    return try WeChatExport.export(text: text, source: selectedSource, destination: destination, clipboardMetadata: metadata)
-                }.value
-                result = output
+                result = try await task.value
+                status = ""
+            } catch is CancellationError {
+                status = "已取消，本次未完成的结果已清理。"
             } catch {
-                self.error = "导出失败：\(error.localizedDescription)。如已创建结果文件夹，可在本地导出目录检查。"
+                status = "导出未完成。"
+                self.error = "导出失败：\(error.localizedDescription)"
             }
+            exportTask = nil
             working = false
         }
     }

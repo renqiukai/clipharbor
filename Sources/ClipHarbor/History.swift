@@ -1,6 +1,6 @@
 import Foundation
 
-enum Clip: Codable, Hashable {
+enum Clip: Codable, Hashable, Sendable {
     case text(String)
     case image(Data)
     case files([String])
@@ -14,12 +14,12 @@ enum Clip: Codable, Hashable {
     }
 }
 
-struct Usage: Codable {
+struct Usage: Codable, Sendable {
     var item: Clip
     var count: Int
 }
 
-struct Archive: Codable {
+struct Archive: Codable, Sendable {
     var items: [Clip]
     var pinned: [Clip]
     var usage: [Usage]? = nil
@@ -54,7 +54,12 @@ struct History {
 
     mutating func add(_ item: Clip) {
         if case .text(let text) = item, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
-        guard !items.contains(where: { $0.duplicateKey == item.duplicateKey }) else { return }
+        if let index = items.firstIndex(where: { $0.duplicateKey == item.duplicateKey }) {
+            guard index >= pinned.count else { return }
+            let existing = items.remove(at: index)
+            items.insert(existing, at: pinned.count)
+            return
+        }
         items.insert(item, at: pinned.count)
         trim()
     }
@@ -96,6 +101,12 @@ struct History {
 
     mutating func clear() {
         items = items.filter { pinned.contains($0) }
+        pruneUsage()
+    }
+
+    mutating func delete(_ item: Clip) {
+        items.removeAll { $0 == item }
+        pinned.removeAll { $0 == item }
         pruneUsage()
     }
 

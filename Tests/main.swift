@@ -1,13 +1,20 @@
 import AppKit
 
+assert(movedSelection(0, count: 0, direction: 1) == 0)
+assert(movedSelection(0, count: 3, direction: -1) == 0)
+assert(movedSelection(0, count: 3, direction: 1) == 1)
+assert(movedSelection(2, count: 3, direction: 1) == 2)
+assert(!hasKeyboardShortcutModifiers([.numericPad, .function]))
+assert(hasKeyboardShortcutModifiers([.shift, .numericPad]))
+
 var history = History(limit: 2)
 history.add(.text("first"))
 history.add(.text("second"))
 history.add(.text("first"))
 history.add(.text("  \n"))
-assert(history.items == [.text("second"), .text("first")])
+assert(history.items == [.text("first"), .text("second")])
 history.add(.text("third"))
-assert(history.items == [.text("third"), .text("second")])
+assert(history.items == [.text("third"), .text("first")])
 history.clear()
 assert(history.items.isEmpty)
 var duplicates = History(items: [.text("é\r\nline"), .text("e\u{301}\nline"), .text("other")], pinned: [.text("e\u{301}\nline")])
@@ -35,7 +42,12 @@ history.togglePin(.text("kept"))
 history.clear()
 assert(history.items.isEmpty)
 
-MainActor.assumeIsolated {
+@MainActor func requireSaved(_ store: ClipboardStore) async {
+    let saved = await store.flush()
+    assert(saved, store.storageStatus ?? "history was not saved")
+}
+
+@MainActor func runChecks() async {
     let board = NSPasteboard(name: NSPasteboard.Name("ClipHarborTests-\(UUID().uuidString)"))
     let suite = "ClipHarborTests-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -51,7 +63,7 @@ MainActor.assumeIsolated {
     assert(store.history.items == [.text("旧记录")])
     board.clearContents()
     board.setString("测试内容 Alpha", forType: .string)
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: 1.2))
+    try! await Task.sleep(nanoseconds: 1_200_000_000)
     assert(store.history.items.first == .text("测试内容 Alpha"), "timer did not record clipboard")
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
     let png = bitmap.representation(using: .png, properties: [:])!
@@ -93,7 +105,7 @@ MainActor.assumeIsolated {
     assert(WeChatExport.parse("名字\n2026年10月31日 18:32\n2026年10月31日 18:33").messages.count == 1)
     board.clearContents()
     board.setData(png, forType: .png)
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: 1.2))
+    try! await Task.sleep(nanoseconds: 1_200_000_000)
     assert(store.history.items.first == .image(png), "timer did not record image")
     let order = store.history.items
     store.copy(.text("测试内容 Alpha"))
@@ -105,6 +117,7 @@ MainActor.assumeIsolated {
     store.copy(.image(png))
     assert(board.data(forType: .png) == png)
     assert(board.data(forType: .tiff) != nil)
+    await requireSaved(store)
     let restored = ClipboardStore(pasteboard: board, defaults: defaults, file: file, monitor: false)
     assert(restored.history.items == store.history.items)
     assert(defaults.stringArray(forKey: "clipboardHistory") == nil)
@@ -128,10 +141,12 @@ MainActor.assumeIsolated {
     assert(store.copy(.rich(parts)))
     assert(board.string(forType: .string) == "聊天记录")
     assert(board.data(forType: .rtf) != nil)
+    await requireSaved(store)
     let pinnedRestored = ClipboardStore(pasteboard: board, defaults: defaults, file: file, monitor: false)
     assert(pinnedRestored.history.pinned == [fileClip])
     store.recordUse(fileClip)
     store.recordUse(fileClip)
+    await requireSaved(store)
     let usageRestored = ClipboardStore(pasteboard: board, defaults: defaults, file: file, monitor: false)
     assert(usageRestored.history.count(for: fileClip) == 2)
     board.clearContents()
@@ -142,6 +157,7 @@ MainActor.assumeIsolated {
     store.poll()
     assert(!store.history.items.contains(.text("secret")))
     store.clear()
+    await requireSaved(store)
     let cleared = ClipboardStore(pasteboard: board, defaults: defaults, file: file, monitor: false)
     assert(cleared.history.items == [fileClip])
     assert(cleared.history.pinned == [fileClip])
@@ -151,4 +167,14 @@ MainActor.assumeIsolated {
     let legacy = ClipboardStore(pasteboard: board, defaults: defaults, file: legacyFile, monitor: false)
     assert(legacy.history.items == [.text("旧版历史")])
     print("History, timer, files, rich text, images, pins, migration, persistence and clear checks passed")
+    store.prepareToTerminate()
+    await runStorageChecks()
+    await runInteractionChecks()
+    try! runWeChatChecks()
 }
+
+Task { @MainActor in
+    await runChecks()
+    exit(0)
+}
+RunLoop.main.run()

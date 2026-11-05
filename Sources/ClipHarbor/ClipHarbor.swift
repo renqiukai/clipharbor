@@ -7,12 +7,21 @@ import ServiceManagement
 final class ClipboardStore: ObservableObject {
     @Published private(set) var history: History
     @Published var error: String?
+    @Published private(set) var isPaused: Bool
+    @Published private(set) var storageStatus: String?
+    @Published private(set) var needsRecovery = false
     private let pasteboard: NSPasteboard
     private let defaults: UserDefaults
     private let file: URL
+    private let historyFile: HistoryFile
+    private let monitorsClipboard: Bool
     private var changeCount: Int
     private var timer: Timer?
-    private var canSave = true
+    private var saveTask: Task<Void, Never>?
+    private var revision = 0
+    private var savedRevision = -1
+    private var recovering = false
+    private var terminating = false
     private let key = "clipboardHistory"
     private let sensitiveTypes = [
         NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),
@@ -26,6 +35,9 @@ final class ClipboardStore: ObservableObject {
         self.pasteboard = pasteboard
         self.defaults = defaults
         self.file = file
+        self.historyFile = HistoryFile(file: file)
+        self.monitorsClipboard = monitor
+        self.isPaused = defaults.bool(forKey: "recordingPaused")
         if FileManager.default.fileExists(atPath: file.path) {
             do {
                 let data = try Data(contentsOf: file)
@@ -36,30 +48,41 @@ final class ClipboardStore: ObservableObject {
                 }
             } catch {
                 history = History()
-                canSave = false
+                needsRecovery = true
+                storageStatus = "历史保存已暂停：原文件无法读取。请备份并恢复后继续保存。"
                 self.error = "无法读取历史记录：\(error.localizedDescription)"
             }
         } else {
             history = History(items: (defaults.stringArray(forKey: key) ?? []).map(Clip.text))
         }
         changeCount = pasteboard.changeCount
-        if monitor {
-            timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.poll() }
-            }
+        do { try HistoryFile.protect(file) }
+        catch {
+            storageStatus = "无法保护历史文件权限：\(error.localizedDescription)"
+            self.error = storageStatus
+        }
+        startMonitoring()
+    }
+
+    private func startMonitoring() {
+        guard monitorsClipboard else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
         }
     }
 
     func poll() {
+        guard !terminating else { return }
         guard pasteboard.changeCount != changeCount else { return }
         changeCount = pasteboard.changeCount
+        guard !isPaused else { return }
         guard pasteboard.availableType(from: sensitiveTypes) == nil else { return }
         let boardItems = pasteboard.pasteboardItems ?? []
         let files = boardItems.compactMap { $0.string(forType: .fileURL) }
-        if !files.isEmpty {
+        if files.count == boardItems.count, !files.isEmpty {
             add(.files(files))
-        } else if boardItems.contains(where: { $0.types.contains(.rtf) || $0.types.contains(.rtfd) || $0.types.contains(.html) }) {
-            let allowed: Set<NSPasteboard.PasteboardType> = [.string, .rtf, .rtfd, .html, .png, .tiff]
+        } else if boardItems.count > 1 || boardItems.contains(where: { $0.types.contains(.rtf) || $0.types.contains(.rtfd) || $0.types.contains(.html) }) {
+            let allowed: Set<NSPasteboard.PasteboardType> = [.string, .rtf, .rtfd, .html, .png, .tiff, .fileURL]
             let representations = boardItems.map { item in
                 Dictionary(uniqueKeysWithValues: item.types.filter { allowed.contains($0) }.compactMap { type in
                     item.data(forType: type).map { (type.rawValue, $0) }
@@ -108,6 +131,34 @@ final class ClipboardStore: ObservableObject {
         save()
     }
 
+    func delete(_ item: Clip) {
+        history.delete(item)
+        save()
+    }
+
+    func setPaused(_ paused: Bool) {
+        isPaused = paused
+        defaults.set(paused, forKey: "recordingPaused")
+        changeCount = pasteboard.changeCount
+    }
+
+    var clipboardVersion: Int { pasteboard.changeCount }
+
+    func isCurrentClipboard(_ version: Int) -> Bool {
+        pasteboard.changeCount == version
+    }
+
+    func prepareToTerminate() {
+        terminating = true
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func cancelTermination() {
+        terminating = false
+        startMonitoring()
+    }
+
     func recordUse(_ item: Clip) {
         history.recordUse(item)
         save()
@@ -124,44 +175,214 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func save() {
-        guard canSave else { return }
-        do {
-            let data = try PropertyListEncoder().encode(Archive(items: history.items, pinned: history.pinned, usage: history.usage))
-            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try data.write(to: file, options: .atomic)
-            defaults.removeObject(forKey: key)
-        } catch {
-            self.error = "无法保存历史记录：\(error.localizedDescription)"
+        revision += 1
+        guard !needsRecovery else { return }
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 150_000_000) }
+            catch { return }
+            _ = await self?.persistLatest()
         }
     }
+
+    private var archive: Archive {
+        Archive(items: history.items, pinned: history.pinned, usage: history.usage)
+    }
+
+    @discardableResult private func persistLatest() async -> Bool {
+        guard !needsRecovery else { return false }
+        let snapshotRevision = revision
+        guard snapshotRevision > savedRevision else { return true }
+        do {
+            try await historyFile.save(archive, revision: snapshotRevision)
+            savedRevision = max(savedRevision, snapshotRevision)
+            defaults.removeObject(forKey: key)
+            if revision == snapshotRevision { storageStatus = nil }
+            return true
+        } catch {
+            if revision == snapshotRevision {
+                storageStatus = "历史尚未保存：\(error.localizedDescription)"
+                self.error = storageStatus
+            }
+            return false
+        }
+    }
+
+    func retrySave() { save() }
+
+    func flush() async -> Bool {
+        saveTask?.cancel()
+        guard !needsRecovery, !recovering else { return false }
+        repeat {
+            let snapshotRevision = revision
+            guard await persistLatest() else { return false }
+            if snapshotRevision == revision { return true }
+        } while true
+    }
+
+    func recoverHistory() {
+        guard needsRecovery, !recovering else { return }
+        recovering = true
+        storageStatus = "正在备份原历史并恢复保存…"
+        let snapshot = archive
+        let snapshotRevision = revision
+        Task {
+            do {
+                let backup = try await historyFile.recover(snapshot, revision: snapshotRevision)
+                needsRecovery = false
+                recovering = false
+                savedRevision = max(savedRevision, snapshotRevision)
+                defaults.removeObject(forKey: key)
+                if await flush() {
+                    storageStatus = nil
+                    error = backup.map { "已恢复保存。原历史备份：\($0.path)" }
+                }
+            } catch {
+                recovering = false
+                storageStatus = "恢复失败，历史保存仍暂停：\(error.localizedDescription)"
+                self.error = storageStatus
+            }
+        }
+    }
+}
+
+func plainTextFromHTML(_ html: String) -> String {
+    // Use local text conversion only: AppKit's HTML importer can load remote resources.
+    var text = html.replacingOccurrences(of: "(?s)<!--.*?(?:-->|$)", with: "", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?is)<(script|style|head)\\b[^>]*>.*?(?:</\\1\\s*>|$)", with: "", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?i)<\\s*(?:br|/?(?:p|div|li|tr|h[1-6]|blockquote))\\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", with: "\n", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?s)<(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", with: "", options: .regularExpression)
+    // shortcut: uncommon HTML named entities stay literal; extend the map if real sources require them.
+    let entities = ["nbsp": " ", "copy": "©", "reg": "®", "trade": "™", "hellip": "…", "ndash": "–", "mdash": "—", "bull": "•", "lsquo": "‘", "rsquo": "’", "ldquo": "“", "rdquo": "”", "euro": "€", "pound": "£", "yen": "¥"]
+    text = CFXMLCreateStringByUnescapingEntities(nil, text as CFString, entities as CFDictionary) as String? ?? text
+    return text.replacingOccurrences(of: "[ \\t\\r\\f]+", with: " ", options: .regularExpression)
+        .replacingOccurrences(of: " *\\n *", with: "\n", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+extension Clip {
+    var plainText: String? {
+        switch self {
+        case .text(let text): return text
+        case .files(let paths): return paths.map { URL(string: $0)?.path ?? $0 }.joined(separator: "\n")
+        case .image: return nil
+        case .rich(let parts):
+            let texts = parts.compactMap { part -> String? in
+                if let data = part[NSPasteboard.PasteboardType.string.rawValue], let text = String(data: data, encoding: .utf8), !text.isEmpty { return text }
+                if let data = part[NSPasteboard.PasteboardType.fileURL.rawValue], let path = String(data: data, encoding: .utf8) { return URL(string: path)?.path ?? path }
+                if let data = part[NSPasteboard.PasteboardType.rtf.rawValue], let text = NSAttributedString(rtf: data, documentAttributes: nil)?.string, !text.isEmpty { return text }
+                if let data = part[NSPasteboard.PasteboardType.rtfd.rawValue], let text = NSAttributedString(rtfd: data, documentAttributes: nil)?.string, !text.isEmpty { return text }
+                if let data = part[NSPasteboard.PasteboardType.html.rawValue], let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) {
+                    let text = plainTextFromHTML(html)
+                    return text.isEmpty ? nil : text
+                }
+                return nil
+            }
+            return texts.isEmpty ? nil : texts.joined(separator: "\n")
+        }
+    }
+
+    var imageData: [Data] {
+        switch self {
+        case .image(let data): return [data]
+        case .rich(let parts): return parts.compactMap { $0[NSPasteboard.PasteboardType.png.rawValue] ?? $0[NSPasteboard.PasteboardType.tiff.rawValue] }
+        default: return []
+        }
+    }
+
+    var previewLabel: String {
+        if let text = plainText, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+        let count = imageData.count
+        return count > 0 ? (count == 1 ? "图片" : "\(count) 张图片") : "富文本内容"
+    }
+}
+
+func movedSelection(_ index: Int, count: Int, direction: Int) -> Int {
+    guard count > 0 else { return 0 }
+    return min(max(index + direction, 0), count - 1)
+}
+
+func hasKeyboardShortcutModifiers(_ flags: NSEvent.ModifierFlags) -> Bool {
+    !flags.intersection([.command, .control, .option, .shift]).isEmpty
+}
+
+func historyNavigationKey(_ event: NSEvent, editor: NSTextView) -> UInt16? {
+    guard !editor.hasMarkedText(), !hasKeyboardShortcutModifiers(event.modifierFlags),
+          [36, 76, 125, 126].contains(event.keyCode) else { return nil }
+    return event.keyCode
+}
+
+private struct HistoryKeys: NSViewRepresentable {
+    var handle: (UInt16) -> Bool
+
+    final class Coordinator {
+        var handle: (UInt16) -> Bool = { _ in false }
+        var monitor: Any?
+        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        let coordinator = context.coordinator
+        coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak view, weak coordinator] event in
+            guard let view, let window = view.window, event.window === window,
+                  let editor = window.firstResponder as? NSTextView,
+                  let key = historyNavigationKey(event, editor: editor), let coordinator else { return event }
+            return coordinator.handle(key) ? nil : event
+        }
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) { context.coordinator.handle = handle }
 }
 
 struct HistoryView: View {
     @ObservedObject var store: ClipboardStore
     var convert: () -> Void = {}
-    var select: (Clip) -> Void
+    var select: (Clip, Bool) -> Void
     @State private var search = ""
     @State private var showFrequent = false
+    @State private var selectedIndex = 0
+    @State private var keyboardNavigation = false
+    @State private var previewItem: Clip?
+    @State private var confirmingClear = false
+    @FocusState private var searchFocused: Bool
     @State private var loginStatus = SMAppService.mainApp.status
     @AppStorage("shortcut") private var shortcut = "optionShiftV"
 
     private var items: [Clip] {
         let source = showFrequent ? store.history.frequent : store.history.items
         guard !search.isEmpty else { return source }
-        return source.filter {
-            switch $0 {
-            case .text(let text): return text.localizedCaseInsensitiveContains(search)
-            case .image: return "图片".localizedCaseInsensitiveContains(search)
-            case .files(let urls): return urls.contains { (URL(string: $0)?.lastPathComponent ?? $0).localizedCaseInsensitiveContains(search) }
-            case .rich(let parts): return parts.contains { $0[NSPasteboard.PasteboardType.string.rawValue].flatMap { String(data: $0, encoding: .utf8) }?.localizedCaseInsensitiveContains(search) ?? false }
-            }
-        }
+        return source.filter { $0.previewLabel.localizedCaseInsensitiveContains(search) }
     }
 
     var body: some View {
+        Group {
+        if let item = previewItem {
+            ClipPreview(item: item, close: { previewItem = nil; searchFocused = true }, select: { plainText in
+                previewItem = nil
+                select(item, plainText)
+            })
+        } else {
         VStack(spacing: 0) {
+            HStack {
+                Label(store.isPaused ? "已暂停记录" : "正在记录", systemImage: store.isPaused ? "pause.circle.fill" : "record.circle")
+                    .foregroundStyle(store.isPaused ? .orange : .secondary)
+                Spacer()
+                Button(store.isPaused ? "继续记录" : "暂停记录") { store.setPaused(!store.isPaused) }
+            }.font(.caption).padding(.horizontal, 12).padding(.top, 10)
+            if let status = store.storageStatus {
+                HStack(alignment: .top) {
+                    Text(status).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button(store.needsRecovery ? "备份并恢复" : "重试保存") {
+                        if store.needsRecovery { store.recoverHistory() } else { store.retrySave() }
+                    }.font(.caption)
+                }.padding(.horizontal, 12).padding(.top, 8)
+            }
             TextField("搜索剪贴板", text: $search)
                 .textFieldStyle(.roundedBorder)
+                .focused($searchFocused)
                 .padding(12)
             Picker("历史视图", selection: $showFrequent) {
                 Text("全部").tag(false)
@@ -173,26 +394,17 @@ struct HistoryView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(items, id: \.self) { item in
+                        ForEach(Array(items.enumerated()), id: \.element) { index, item in
                             HStack(spacing: 0) {
-                            Button { select(item) } label: {
-                                Group {
-                                    switch item {
-                                    case .text(let text): Text(text).lineLimit(2)
-                                    case .files(let urls):
-                                        Text(urls.compactMap { URL(string: $0)?.lastPathComponent }.joined(separator: ", ")).lineLimit(2)
-                                    case .rich(let parts):
-                                        Text(parts.compactMap { $0[NSPasteboard.PasteboardType.string.rawValue].flatMap { String(data: $0, encoding: .utf8) } }.joined(separator: "\n")).lineLimit(2)
-                                    case .image(let data):
-                                        HStack {
-                                            if let image = NSImage(data: data) {
-                                                Image(nsImage: image).resizable().scaledToFit().frame(width: 64, height: 48)
-                                            }
-                                            Text("图片")
-                                        }
+                            Button { select(item, false) } label: {
+                                HStack {
+                                    if let data = item.imageData.first, let image = NSImage(data: data) {
+                                        Image(nsImage: image).resizable().scaledToFit().frame(width: 64, height: 48)
                                     }
+                                    Text(item.previewLabel).lineLimit(2)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 12)
@@ -204,14 +416,35 @@ struct HistoryView: View {
                             if showFrequent {
                                 Text("\(store.history.count(for: item)) 次").font(.caption).foregroundStyle(.secondary)
                             }
+                            Button { previewItem = item } label: {
+                                Image(systemName: "eye")
+                            }.buttonStyle(.plain).padding(6).help("完整预览").accessibilityLabel("完整预览")
                             Button { store.togglePin(item) } label: {
                                 Image(systemName: store.history.pinned.contains(item) ? "pin.fill" : "pin")
                             }.buttonStyle(.plain).padding(10)
                                 .help(store.history.pinned.contains(item) ? "取消置顶" : "置顶")
+                                .accessibilityLabel(store.history.pinned.contains(item) ? "取消置顶" : "置顶")
+                            Menu {
+                                Button("按原格式粘贴") { select(item, false) }
+                                Button("以纯文本粘贴") { select(item, true) }.disabled(item.plainText == nil)
+                                Divider()
+                                Button("删除这条记录", role: .destructive) { store.delete(item) }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                            }.menuStyle(.borderlessButton).fixedSize().padding(.trailing, 8).accessibilityLabel("记录操作")
                             }
+                            .background(index == selectedIndex ? Color.accentColor.opacity(0.18) : Color.clear)
+                            .onHover { hovering in
+                                if hovering { keyboardNavigation = false; selectedIndex = index }
+                            }
+                            .id(index)
                             Divider()
                         }
                     }
+                }
+                .onChange(of: selectedIndex) { index in
+                    if keyboardNavigation { proxy.scrollTo(index, anchor: .center) }
+                }
                 }
             }
             Divider()
@@ -237,7 +470,7 @@ struct HistoryView: View {
                 }
             }.padding(.horizontal, 12).padding(.top, 8)
             HStack {
-                Button("清空未置顶") { store.clear() }.disabled(store.history.items.count == store.history.pinned.count)
+                Button("清空未置顶") { confirmingClear = true }.disabled(store.history.items.count == store.history.pinned.count)
                 Spacer()
                 Menu("快捷键") {
                     Picker("调出历史", selection: $shortcut) {
@@ -249,21 +482,72 @@ struct HistoryView: View {
                 Button("退出") { NSApplication.shared.terminate(nil) }
             }.padding(12)
         }
-        .frame(width: 340, height: 400)
-        .onAppear { loginStatus = SMAppService.mainApp.status }
+        }
+        }
+        .frame(width: 440, height: 520)
+        .background(HistoryKeys { key in
+            guard previewItem == nil, !confirmingClear else { return false }
+            switch key {
+            case 125: keyboardNavigation = true; selectedIndex = movedSelection(selectedIndex, count: items.count, direction: 1); return true
+            case 126: keyboardNavigation = true; selectedIndex = movedSelection(selectedIndex, count: items.count, direction: -1); return true
+            case 36, 76:
+                guard items.indices.contains(selectedIndex) else { return false }
+                select(items[selectedIndex], false); return true
+            default: return false
+            }
+        })
+        .onChange(of: items) { _ in selectedIndex = 0 }
+        .onAppear { loginStatus = SMAppService.mainApp.status; searchFocused = true }
+        .confirmationDialog("清空所有未置顶记录？", isPresented: $confirmingClear, titleVisibility: .visible) {
+            Button("清空未置顶", role: .destructive) { store.clear() }
+            Button("取消", role: .cancel) {}
+        } message: { Text("这些记录及使用次数会从本机删除，置顶项保留。") }
         .alert("剪贴板历史", isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) {
             Button("好") { store.error = nil }
         } message: { Text(store.error ?? "") }
     }
 }
 
-#if !CLIPBOARD_TEST
+private struct ClipPreview: View {
+    let item: Clip
+    let close: () -> Void
+    let select: (Bool) -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Button(action: close) { Label("返回", systemImage: "chevron.left") }
+                Spacer()
+                Text("完整预览").font(.headline)
+                Spacer()
+            }
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let text = item.plainText { Text(text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    ForEach(Array(item.imageData.enumerated()), id: \.offset) { _, data in
+                        if let image = NSImage(data: data) { Image(nsImage: image).resizable().scaledToFit().accessibilityLabel("剪贴板图片") }
+                    }
+                    if item.plainText == nil && item.imageData.isEmpty { Text("此格式无法预览，可按原格式粘贴。").foregroundStyle(.secondary) }
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            HStack {
+                Button("按原格式粘贴") { select(false) }
+                Button("以纯文本粘贴") { select(true) }.disabled(item.plainText == nil)
+            }
+        }.padding(12)
+    }
+}
+
 @MainActor
 final class PasteController: ObservableObject {
     private var target: NSRunningApplication?
     private var observer: NSObjectProtocol?
+    private var pendingPaste: UUID?
 
-    init() {
+    init(trackApplications: Bool = true) {
+        guard trackApplications else { return }
         rememberFrontmost()
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -281,8 +565,16 @@ final class PasteController: ObservableObject {
         }
     }
 
-    func paste(_ item: Clip, store: ClipboardStore) {
-        guard store.copy(item) else { return }
+    func paste(_ item: Clip, store: ClipboardStore, plainText: Bool = false) {
+        cancelPendingPaste()
+        let copiedItem: Clip
+        if plainText {
+            guard let text = item.plainText else { store.error = "这条记录没有可粘贴的文字。"; return }
+            copiedItem = .text(text)
+        } else {
+            copiedItem = item
+        }
+        guard store.copy(copiedItem) else { return }
         guard let target, !target.isTerminated else {
             store.error = "找不到之前的应用。内容已复制，可手动粘贴。"
             return
@@ -294,20 +586,38 @@ final class PasteController: ObservableObject {
         }
         NSApp.keyWindow?.orderOut(nil)
         target.activate()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        queuePaste(item, store: store) {
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
                   let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else {
-                store.error = "未能回到原应用，内容已复制，可手动粘贴。"
-                return
+                return false
             }
             down.flags = .maskCommand
             up.flags = .maskCommand
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
+            return true
+        }
+    }
+
+    func cancelPendingPaste() { pendingPaste = nil }
+
+    func queuePaste(_ item: Clip, store: ClipboardStore, send: @escaping () -> Bool) {
+        let request = UUID()
+        pendingPaste = request
+        let version = store.clipboardVersion
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, self.pendingPaste == request else { return }
+            self.pendingPaste = nil
+            guard store.isCurrentClipboard(version) else {
+                store.error = "剪贴板已被其他内容更新，已取消本次粘贴。请重新选择记录。"
+                return
+            }
+            guard send() else {
+                store.error = "未能回到原应用，内容已复制，可手动粘贴。"
+                return
+            }
             store.recordUse(item)
         }
     }
 }
-
-#endif

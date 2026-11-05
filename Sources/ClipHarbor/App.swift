@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var conversionWindow: NSWindow?
     private var lastShortcut = ""
     private var defaultsObserver: NSObjectProtocol?
+    private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -19,11 +20,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggle)
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 340, height: 400)
-        popover.contentViewController = NSHostingController(rootView: HistoryView(store: store, convert: { [weak self] in self?.showWeChatExport() }) { [weak self] item in
+        popover.contentSize = NSSize(width: 440, height: 520)
+        popover.contentViewController = NSHostingController(rootView: HistoryView(store: store, convert: { [weak self] in self?.showWeChatExport() }) { [weak self] item, plainText in
             guard let self else { return }
             self.popover.performClose(nil)
-            self.pasteController.paste(item, store: self.store)
+            self.pasteController.paste(item, store: self.store, plainText: plainText)
         })
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
@@ -36,6 +37,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.registerShortcut() }
         }
         registerShortcut()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationPending else { return .terminateLater }
+        terminationPending = true
+        pasteController.cancelPendingPaste()
+        popover.performClose(nil)
+        store.prepareToTerminate()
+        Task { @MainActor in
+            var shouldQuit = await store.flush()
+            if !shouldQuit {
+                let alert = NSAlert()
+                alert.messageText = "历史记录尚未保存"
+                alert.informativeText = "\(store.storageStatus ?? "无法保存最后的修改。")\n留在应用中可重试保存；仍然退出会丢失尚未保存的修改。"
+                alert.addButton(withTitle: "留在应用")
+                alert.addButton(withTitle: "仍然退出")
+                NSApp.activate(ignoringOtherApps: true)
+                shouldQuit = alert.runModal() == .alertSecondButtonReturn
+            }
+            if !shouldQuit { store.cancelTermination() }
+            terminationPending = false
+            sender.reply(toApplicationShouldTerminate: shouldQuit)
+        }
+        return .terminateLater
     }
 
     private func showWeChatExport() {

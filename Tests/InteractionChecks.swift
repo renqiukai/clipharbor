@@ -1,0 +1,89 @@
+import AppKit
+
+@MainActor
+func runInteractionChecks() async {
+    let html = "<head><style>body { background: url(https://invalid.example/image); }</style></head><p>A &amp; B&nbsp;&#x4E2D;&#25991;</p><p>第二<br>行</p><img src='https://invalid.example/image'><script>hidden()</script>"
+    let text = plainTextFromHTML(html)
+    assert(text.contains("A & B 中文") && text.contains("第二\n行"))
+    assert(!text.contains("hidden") && !text.contains("https://") && !text.contains("background"))
+    assert(plainTextFromHTML("<p title='a > b'>Visible &lt;tag&gt;</p>") == "Visible <tag>")
+    let rich = Clip.rich([[NSPasteboard.PasteboardType.html.rawValue: Data(html.utf8)]])
+    assert(rich.plainText == text && rich.previewLabel.contains("中文"))
+    let utf16HTML = Clip.rich([[NSPasteboard.PasteboardType.html.rawValue: "<p>UTF16 中文</p>".data(using: .utf16)!]])
+    assert(utf16HTML.plainText == "UTF16 中文")
+    let mixedFiles = Clip.rich([[NSPasteboard.PasteboardType.fileURL.rawValue: Data("file:///tmp/a%20b.txt".utf8)], [NSPasteboard.PasteboardType.string.rawValue: Data("保留其他文字".utf8)], [NSPasteboard.PasteboardType.png.rawValue: Data([1])]])
+    assert(mixedFiles.plainText == "/tmp/a b.txt\n保留其他文字" && mixedFiles.imageData.count == 1)
+    assert(mixedFiles.previewLabel.contains("a b.txt"))
+    let multipleImages = Clip.rich([[NSPasteboard.PasteboardType.png.rawValue: Data([1])], [NSPasteboard.PasteboardType.tiff.rawValue: Data([2])]])
+    assert(multipleImages.plainText == nil && multipleImages.imageData.count == 2)
+    assert(multipleImages.previewLabel == "2 张图片")
+    assert(Clip.files(["file:///tmp/a%20b.txt"]).plainText == "/tmp/a b.txt")
+
+    let editor = NSTextView(frame: .zero)
+    let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+    let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.function, .numericPad], timestamp: 0, windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "", isARepeat: false, keyCode: 125)!
+    editor.setMarkedText("nihao", selectedRange: NSRange(location: 5, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+    assert(editor.hasMarkedText())
+    assert(historyNavigationKey(enter, editor: editor) == nil)
+    assert(historyNavigationKey(down, editor: editor) == nil)
+    editor.unmarkText()
+    assert(historyNavigationKey(enter, editor: editor) == 36)
+    assert(historyNavigationKey(down, editor: editor) == 125)
+
+    let name = "ClipHarborInteractionTests-\(UUID().uuidString)"
+    let board = NSPasteboard(name: NSPasteboard.Name(name))
+    let defaults = UserDefaults(suiteName: name)!
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    defer {
+        board.releaseGlobally()
+        defaults.removePersistentDomain(forName: name)
+        try? FileManager.default.removeItem(at: directory)
+    }
+    let store = ClipboardStore(pasteboard: board, defaults: defaults, file: directory.appendingPathComponent("history.plist"), monitor: false)
+    let controller = PasteController(trackApplications: false)
+    let first = Clip.text("first")
+    let second = Clip.text("second")
+    for value in ["first", "second"] {
+        board.clearContents()
+        board.setString(value, forType: .string)
+        store.poll()
+    }
+    var sent: [Clip] = []
+    assert(store.copy(first))
+    controller.queuePaste(first, store: store) { sent.append(first); return true }
+    board.clearContents()
+    board.setString("newer external content", forType: .string)
+    try? await Task.sleep(nanoseconds: 450_000_000)
+    assert(sent.isEmpty && store.history.count(for: first) == 0)
+    assert(board.string(forType: .string) == "newer external content")
+    assert(store.error?.contains("已取消") == true)
+
+    assert(store.copy(first))
+    controller.queuePaste(first, store: store) { sent.append(first); return true }
+    assert(store.copy(second))
+    controller.queuePaste(second, store: store) { sent.append(second); return true }
+    try? await Task.sleep(nanoseconds: 450_000_000)
+    assert(sent == [second])
+    assert(store.history.count(for: first) == 0 && store.history.count(for: second) == 1)
+
+    assert(store.copy(first))
+    controller.queuePaste(first, store: store) { sent.append(first); return true }
+    controller.cancelPendingPaste()
+    try? await Task.sleep(nanoseconds: 450_000_000)
+    assert(sent == [second] && store.history.count(for: first) == 0)
+
+    board.clearContents()
+    let item = NSPasteboardItem()
+    item.setData(Data("<p>Plain paste</p>".utf8), forType: .html)
+    board.writeObjects([item])
+    store.poll()
+    let original = store.history.items.first!
+    assert(original.plainText == "Plain paste")
+    assert(store.copy(.text(original.plainText!)))
+    controller.queuePaste(original, store: store) { sent.append(original); return true }
+    try? await Task.sleep(nanoseconds: 450_000_000)
+    assert(store.history.count(for: original) == 1)
+    assert(board.string(forType: .string) == "Plain paste" && board.data(forType: .html) == nil)
+    await requireSaved(store)
+    print("Interaction checks passed: IME, HTML, image preview labels, paste races and original-item counts")
+}
