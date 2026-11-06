@@ -119,29 +119,28 @@ enum WeChatExport {
         var blocked: Set<String> = []
         if let source, let messages {
             let root = source.standardizedFileURL.resolvingSymlinksInPath()
-            var associations: [String: [URL]] = [:]
+            var associations: [String: Set<URL>] = [:]
             let metadataMatches = messageTexts(messages, matching: text) != nil
             for message in messages {
                 try checkCancellation()
-                let messageRefs = references(in: message.text ?? "")
-                if !metadataMatches || messageRefs.count > 1 {
+                let messageRefs = Set(references(in: message.text ?? ""))
+                if !metadataMatches {
                     blocked.formUnion(messageRefs.filter { names.contains($0) })
                     continue
                 }
                 guard messageRefs.count == 1, let name = messageRefs.first,
                       names.contains(name),
                       let path = message.file, path.hasPrefix("/") else { continue }
-                guard refs.filter({ $0 == name }).count == 1 else { blocked.insert(name); continue }
                 let file = URL(fileURLWithPath: path).standardizedFileURL
                 guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
                       values.isRegularFile == true, values.isSymbolicLink != true,
                       file.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") else { continue }
-                associations[name, default: []].append(file)
+                associations[name, default: []].insert(file.resolvingSymlinksInPath())
             }
             let repeatedPaths = Dictionary(grouping: associations.values.flatMap { $0 }, by: { $0.resolvingSymlinksInPath() })
             for (name, urls) in associations {
-                if urls.count == 1 && repeatedPaths[urls[0].resolvingSymlinksInPath()]?.count == 1 && !blocked.contains(name) {
-                    direct[name] = urls[0]
+                if urls.count == 1, let file = urls.first, repeatedPaths[file]?.count == 1, !blocked.contains(name) {
+                    direct[name] = file
                 } else { blocked.insert(name) }
             }
         }
@@ -249,7 +248,7 @@ enum WeChatExport {
             let exportError = error
             do { try fm.removeItem(at: output) }
             catch {
-                throw NSError(domain: "ClipHarbor.Export", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                throw NSError(domain: "ClipHarbor.Export", code: 1, userInfo: [NSFilePathErrorKey: output.path, NSLocalizedDescriptionKey:
                     "导出未完成，且无法清理本次目录 \(output.path)：\(error.localizedDescription)"])
             }
             throw exportError

@@ -19,8 +19,10 @@ actor HistoryFile {
     func save(_ archive: Archive, revision: Int) throws {
         // Older queued snapshots must never overwrite a newer completed save.
         guard revision > savedRevision else { return }
+        try Task.checkCancellation()
         try Self.protect(file)
         let data = try PropertyListEncoder().encode(archive)
+        try Task.checkCancellation()
         try data.write(to: file, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         savedRevision = revision

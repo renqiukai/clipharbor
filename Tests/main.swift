@@ -171,6 +171,7 @@ assert(history.items.isEmpty)
     await runStorageChecks()
     await runInteractionChecks()
     try! runWeChatChecks()
+    try! await runWeChatLifecycleChecks()
 }
 
 Task { @MainActor in

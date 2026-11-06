@@ -41,6 +41,33 @@ func runWeChatChecks() throws {
     let direct = try WeChatExport.export(text: chat, source: source, destination: destination, clipboardMetadata: valid)
     let actual = try Data(contentsOf: direct.directory.appendingPathComponent("images/image-001.png"))
     assert(actual == red && actual != blue && direct.matched == 1)
+    let repeatedChat = "小李\n2026年10月31日 18:33\n[图片] chat.dat"
+    let repeatedText = chat + "\n\n" + repeatedChat
+    let repeatedMetadata = try JSONSerialization.data(withJSONObject: [["text": chat, "file": first.path], ["text": repeatedChat, "file": first.path]])
+    let repeated = try WeChatExport.export(text: repeatedText, source: source, destination: destination, clipboardMetadata: repeatedMetadata)
+    let repeatedImage = try Data(contentsOf: repeated.directory.appendingPathComponent("images/image-001.png"))
+    let repeatedFiles = try fm.contentsOfDirectory(atPath: repeated.directory.appendingPathComponent("images").path)
+    assert(repeated.matched == 2 && repeated.unmatched == 0 && repeatedFiles.count == 1)
+    assert(repeatedImage == red && repeatedImage != blue, "the same image in two messages must reuse its verified path, not the decoy")
+
+    let actualConflict = try JSONSerialization.data(withJSONObject: [["text": chat, "file": first.path], ["text": repeatedChat, "file": second.path]])
+    let conflicting = try WeChatExport.export(text: repeatedText, source: source, destination: destination, clipboardMetadata: actualConflict)
+    assert(conflicting.matched == 0 && conflicting.unmatched == 2, "matching metadata with two different paths must still block the decoy")
+
+    let repeatedInMessage = chat + "\n[图片] chat.dat"
+    let repeatedInMessageMetadata = try JSONSerialization.data(withJSONObject: [["text": repeatedInMessage, "file": first.path]])
+    let reused = try WeChatExport.export(text: repeatedInMessage, source: source, destination: destination, clipboardMetadata: repeatedInMessageMetadata)
+    let reusedImage = try Data(contentsOf: reused.directory.appendingPathComponent("images/image-001.png"))
+    assert(reused.matched == 2 && reusedImage == red, "repeated references inside one message still have one known image")
+
+    try green.write(to: source.appendingPathComponent("second.dat"))
+    let multiImageText = chat + "\n[图片] second.dat"
+    let multiImageMetadata = try JSONSerialization.data(withJSONObject: [["text": multiImageText]])
+    let multi = try WeChatExport.export(text: multiImageText, source: source, destination: destination, clipboardMetadata: multiImageMetadata)
+    let multiFirst = try Data(contentsOf: multi.directory.appendingPathComponent("images/image-001.png"))
+    let multiSecond = try Data(contentsOf: multi.directory.appendingPathComponent("images/image-002.png"))
+    assert(multi.matched == 2 && multi.unmatched == 0 && Set([multiFirst, multiSecond]) == Set([blue, green]),
+           "a multi-image message without direct paths must retain unique-name fallback")
     let stale = try JSONSerialization.data(withJSONObject: [["text": chat.replacingOccurrences(of: "小王", with: "小李"), "file": first.path]])
     let staleResult = try WeChatExport.export(text: chat, source: source, destination: destination, clipboardMetadata: stale)
     assert(staleResult.matched == 0 && staleResult.unmatched == 1, "metadata must correspond to the current clipboard text")

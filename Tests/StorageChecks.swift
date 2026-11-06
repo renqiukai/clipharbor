@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 @MainActor func runStorageChecks() async {
     let suite = "ClipHarborStorage-\(UUID().uuidString)"
@@ -34,6 +35,23 @@ import AppKit
     assert(read(file).items == [.text("keep")])
     assert(read(file).usage?.count == 1)
     assert(permissions(directory) == 0o700 && permissions(file) == 0o600)
+
+    copyText("ordinary", to: store)
+    await requireSaved(store)
+    let originalFile = try! fm.attributesOfItem(atPath: file.path)
+    var historyUpdates = 0
+    let observation = store.$history.dropFirst().sink { _ in historyUpdates += 1 }
+    for value in [" \n\t", "keep", "ordinary"] { copyText(value, to: store) }
+    await requireSaved(store)
+    let unchangedFile = try! fm.attributesOfItem(atPath: file.path)
+    assert(historyUpdates == 0, "unchanged clipboard content must not redraw the history")
+    assert(originalFile[.systemFileNumber] as? NSNumber == unchangedFile[.systemFileNumber] as? NSNumber)
+    assert(originalFile[.modificationDate] as? Date == unchangedFile[.modificationDate] as? Date)
+    observation.cancel()
+    copyText("new ordinary", to: store)
+    copyText("ordinary", to: store)
+    await requireSaved(store)
+    assert(read(file).items.prefix(3) == [.text("keep"), .text("ordinary"), .text("new ordinary")])
 
     store.setPaused(true)
     copyText("private", to: store)
@@ -126,6 +144,18 @@ import AppKit
     try! await writer.save(Archive(items: [.text("new")], pinned: []), revision: 3)
     try! await writer.save(Archive(items: [.text("old")], pinned: []), revision: 2)
     assert(read(versionedFile).items == [.text("new")])
+
+    let cancelled = Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        try await writer.save(Archive(items: [.text("cancelled")], pinned: []), revision: 4)
+    }
+    do {
+        try await cancelled.value
+        fatalError("cancelled queued snapshots must not write")
+    } catch is CancellationError {} catch { fatalError("unexpected cancellation error: \(error)") }
+    assert(read(versionedFile).items == [.text("new")])
+    try! await writer.save(Archive(items: [.text("latest")], pinned: []), revision: 5)
+    assert(read(versionedFile).items == [.text("latest")])
 
     let blockedFile = directory.appendingPathComponent("blocked.plist")
     try! fm.createDirectory(at: blockedFile, withIntermediateDirectories: false)

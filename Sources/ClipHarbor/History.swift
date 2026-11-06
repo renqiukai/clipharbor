@@ -52,16 +52,17 @@ struct History {
         self.limit = limit
     }
 
-    mutating func add(_ item: Clip) {
-        if case .text(let text) = item, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+    @discardableResult mutating func add(_ item: Clip) -> Bool {
+        if case .text(let text) = item, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         if let index = items.firstIndex(where: { $0.duplicateKey == item.duplicateKey }) {
-            guard index >= pinned.count else { return }
+            guard index > pinned.count else { return false }
             let existing = items.remove(at: index)
             items.insert(existing, at: pinned.count)
-            return
+            return true
         }
         items.insert(item, at: pinned.count)
         trim()
+        return true
     }
 
     func count(for item: Clip) -> Int {

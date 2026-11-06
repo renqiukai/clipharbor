@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import ApplicationServices
 import ServiceManagement
 
@@ -170,7 +171,9 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func add(_ item: Clip) {
-        history.add(item)
+        var updated = history
+        guard updated.add(item) else { return }
+        history = updated
         save()
     }
 
@@ -199,6 +202,8 @@ final class ClipboardStore: ObservableObject {
             defaults.removeObject(forKey: key)
             if revision == snapshotRevision { storageStatus = nil }
             return true
+        } catch is CancellationError {
+            return false
         } catch {
             if revision == snapshotRevision {
                 storageStatus = "历史尚未保存：\(error.localizedDescription)"
@@ -250,13 +255,38 @@ func plainTextFromHTML(_ html: String) -> String {
     // Use local text conversion only: AppKit's HTML importer can load remote resources.
     var text = html.replacingOccurrences(of: "(?s)<!--.*?(?:-->|$)", with: "", options: .regularExpression)
     text = text.replacingOccurrences(of: "(?is)<(script|style|head)\\b[^>]*>.*?(?:</\\1\\s*>|$)", with: "", options: .regularExpression)
-    text = text.replacingOccurrences(of: "(?i)<\\s*(?:br|/?(?:p|div|li|tr|h[1-6]|blockquote))\\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", with: "\n", options: .regularExpression)
-    text = text.replacingOccurrences(of: "(?s)<(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", with: "", options: .regularExpression)
+    let source = text as NSString
+    let pre = try! NSRegularExpression(pattern: "(?is)<pre\\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*>(.*?)(?:</pre\\s*>|$)")
+    var sections: [String] = []
+    var offset = 0
+    for match in pre.matches(in: text, range: NSRange(location: 0, length: source.length)) {
+        let normal = htmlFragmentText(source.substring(with: NSRange(location: offset, length: match.range.location - offset)))
+        if !normal.isEmpty { sections.append(normal) }
+        sections.append(htmlFragmentText(source.substring(with: match.range(at: 1)), preservingWhitespace: true))
+        offset = NSMaxRange(match.range)
+    }
+    let trailing = htmlFragmentText(source.substring(from: offset))
+    if !trailing.isEmpty { sections.append(trailing) }
+    var result = ""
+    for section in sections {
+        if !result.isEmpty, !result.hasSuffix("\n"), !section.hasPrefix("\n") { result += "\n" }
+        result += section
+    }
+    return result
+}
+
+private func htmlFragmentText(_ html: String, preservingWhitespace: Bool = false) -> String {
+    var text = preservingWhitespace ? html : html.replacingOccurrences(of: "[ \\t\\r\\f]+", with: " ", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?i)<(?:br|/?(?:p|div|li|tr|h[1-6]|blockquote))\\b(?:\"[^\"]*\"|'[^']*'|[^'\">])*>", with: "\n", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?i)</(?:td|th)\\s*>", with: "\t", options: .regularExpression)
+    text = text.replacingOccurrences(of: "(?s)<(?:/?[A-Za-z][A-Za-z0-9:-]*|![A-Za-z]+|\\?xml\\b)(?:\"[^\"]*\"|'[^']*'|[^'\"<>])*>", with: "", options: .regularExpression)
     // shortcut: uncommon HTML named entities stay literal; extend the map if real sources require them.
     let entities = ["nbsp": " ", "copy": "©", "reg": "®", "trade": "™", "hellip": "…", "ndash": "–", "mdash": "—", "bull": "•", "lsquo": "‘", "rsquo": "’", "ldquo": "“", "rdquo": "”", "euro": "€", "pound": "£", "yen": "¥"]
     text = CFXMLCreateStringByUnescapingEntities(nil, text as CFString, entities as CFDictionary) as String? ?? text
-    return text.replacingOccurrences(of: "[ \\t\\r\\f]+", with: " ", options: .regularExpression)
-        .replacingOccurrences(of: " *\\n *", with: "\n", options: .regularExpression)
+    if preservingWhitespace { return text }
+    return text.replacingOccurrences(of: " +", with: " ", options: .regularExpression)
+        .replacingOccurrences(of: "[ \\t]*\\n[ \\t]*", with: "\n", options: .regularExpression)
+        .replacingOccurrences(of: "\\n{2,}", with: "\n", options: .regularExpression)
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
@@ -291,9 +321,46 @@ extension Clip {
     }
 
     var previewLabel: String {
-        if let text = plainText, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+        previewLabel(plainText: plainText)
+    }
+
+    func previewLabel(plainText text: String?) -> String {
+        if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
         let count = imageData.count
         return count > 0 ? (count == 1 ? "图片" : "\(count) 张图片") : "富文本内容"
+    }
+}
+
+struct ClipTextPresentation {
+    let plainText: String?
+    let label: String
+}
+
+@MainActor
+final class ClipTextCache: ObservableObject {
+    private var values: [Clip: ClipTextPresentation] = [:]
+    private var historyKeys: Set<Clip> = []
+    private var subscription: AnyCancellable?
+    private let extract: (Clip) -> String?
+
+    init(store: ClipboardStore, extract: @escaping (Clip) -> String? = { $0.plainText }) {
+        self.extract = extract
+        subscription = store.$history.sink { [weak self] history in
+            guard let self else { return }
+            self.historyKeys = Set(history.items)
+            self.values = self.values.filter { self.historyKeys.contains($0.key) }
+        }
+    }
+
+    var cachedCount: Int { values.count }
+
+    func presentation(for item: Clip) -> ClipTextPresentation {
+        if let value = values[item] { return value }
+        let text = extract(item)
+        let value = ClipTextPresentation(plainText: text, label: item.previewLabel(plainText: text))
+        // A view can finish evaluating a removed row before its next update.
+        if historyKeys.contains(item) { values[item] = value }
+        return value
     }
 }
 
@@ -336,8 +403,23 @@ private struct HistoryKeys: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) { context.coordinator.handle = handle }
 }
 
+enum HarborStyle {
+    static let accent = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(red: 0.39, green: 0.83, blue: 0.77, alpha: 1)
+            : NSColor(red: 0.03, green: 0.46, blue: 0.43, alpha: 1)
+    })
+    static let canvas = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(red: 0.12, green: 0.14, blue: 0.15, alpha: 1)
+            : NSColor(red: 0.95, green: 0.96, blue: 0.96, alpha: 1)
+    })
+    static let surface = Color(nsColor: .controlBackgroundColor)
+}
+
 struct HistoryView: View {
     @ObservedObject var store: ClipboardStore
+    @StateObject private var textCache: ClipTextCache
     var convert: () -> Void = {}
     var select: (Clip, Bool) -> Void
     @State private var search = ""
@@ -350,141 +432,92 @@ struct HistoryView: View {
     @State private var loginStatus = SMAppService.mainApp.status
     @AppStorage("shortcut") private var shortcut = "optionShiftV"
 
+    init(store: ClipboardStore, convert: @escaping () -> Void = {}, select: @escaping (Clip, Bool) -> Void) {
+        self.store = store
+        self.convert = convert
+        self.select = select
+        _textCache = StateObject(wrappedValue: ClipTextCache(store: store))
+    }
+
     private var items: [Clip] {
         let source = showFrequent ? store.history.frequent : store.history.items
         guard !search.isEmpty else { return source }
-        return source.filter { $0.previewLabel.localizedCaseInsensitiveContains(search) }
+        return source.filter { textCache.presentation(for: $0).label.localizedCaseInsensitiveContains(search) }
     }
 
     var body: some View {
         Group {
-        if let item = previewItem {
-            ClipPreview(item: item, close: { previewItem = nil; searchFocused = true }, select: { plainText in
-                previewItem = nil
-                select(item, plainText)
-            })
-        } else {
-        VStack(spacing: 0) {
-            HStack {
-                Label(store.isPaused ? "已暂停记录" : "正在记录", systemImage: store.isPaused ? "pause.circle.fill" : "record.circle")
-                    .foregroundStyle(store.isPaused ? .orange : .secondary)
-                Spacer()
-                Button(store.isPaused ? "继续记录" : "暂停记录") { store.setPaused(!store.isPaused) }
-            }.font(.caption).padding(.horizontal, 12).padding(.top, 10)
-            if let status = store.storageStatus {
-                HStack(alignment: .top) {
-                    Text(status).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button(store.needsRecovery ? "备份并恢复" : "重试保存") {
-                        if store.needsRecovery { store.recoverHistory() } else { store.retrySave() }
-                    }.font(.caption)
-                }.padding(.horizontal, 12).padding(.top, 8)
-            }
-            TextField("搜索剪贴板", text: $search)
-                .textFieldStyle(.roundedBorder)
-                .focused($searchFocused)
-                .padding(12)
-            Picker("历史视图", selection: $showFrequent) {
-                Text("全部").tag(false)
-                Text("常用").tag(true)
-            }.pickerStyle(.segmented).padding(.horizontal, 12).padding(.bottom, 8)
-            Divider()
-            if items.isEmpty {
-                Text(!search.isEmpty ? "没有匹配的记录" : (showFrequent ? "暂无常用记录" : "暂无剪贴板记录"))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let item = previewItem {
+                ClipPreview(item: item, text: textCache.presentation(for: item).plainText, close: { previewItem = nil; searchFocused = true }, select: { plainText in
+                    previewItem = nil
+                    select(item, plainText)
+                })
             } else {
-                ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(items.enumerated()), id: \.element) { index, item in
-                            HStack(spacing: 0) {
-                            Button { select(item, false) } label: {
-                                HStack {
-                                    if let data = item.imageData.first, let image = NSImage(data: data) {
-                                        Image(nsImage: image).resizable().scaledToFit().frame(width: 64, height: 48)
-                                    }
-                                    Text(item.previewLabel).lineLimit(2)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help("点击粘贴到之前的应用")
-                            if showFrequent {
-                                Text("\(store.history.count(for: item)) 次").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Button { previewItem = item } label: {
-                                Image(systemName: "eye")
-                            }.buttonStyle(.plain).padding(6).help("完整预览").accessibilityLabel("完整预览")
-                            Button { store.togglePin(item) } label: {
-                                Image(systemName: store.history.pinned.contains(item) ? "pin.fill" : "pin")
-                            }.buttonStyle(.plain).padding(10)
-                                .help(store.history.pinned.contains(item) ? "取消置顶" : "置顶")
-                                .accessibilityLabel(store.history.pinned.contains(item) ? "取消置顶" : "置顶")
-                            Menu {
-                                Button("按原格式粘贴") { select(item, false) }
-                                Button("以纯文本粘贴") { select(item, true) }.disabled(item.plainText == nil)
-                                Divider()
-                                Button("删除这条记录", role: .destructive) { store.delete(item) }
-                            } label: {
-                                Image(systemName: "ellipsis")
-                            }.menuStyle(.borderlessButton).fixedSize().padding(.trailing, 8).accessibilityLabel("记录操作")
-                            }
-                            .background(index == selectedIndex ? Color.accentColor.opacity(0.18) : Color.clear)
-                            .onHover { hovering in
-                                if hovering { keyboardNavigation = false; selectedIndex = index }
-                            }
-                            .id(index)
-                            Divider()
+                VStack(spacing: 0) {
+                    header
+                    if let status = store.storageStatus {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text(status).font(.caption).fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                            Button(store.needsRecovery ? "备份并恢复" : "重试保存") {
+                                if store.needsRecovery { store.recoverHistory() } else { store.retrySave() }
+                            }.controlSize(.small)
+                        }
+                        .padding(10).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal, 18).padding(.bottom, 12)
+                    }
+                    HStack(spacing: 9) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        TextField("搜索剪贴板", text: $search)
+                            .textFieldStyle(.plain).focused($searchFocused)
+                        if !search.isEmpty {
+                            Button { search = ""; searchFocused = true } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }.buttonStyle(.plain).accessibilityLabel("清除搜索")
                         }
                     }
-                }
-                .onChange(of: selectedIndex) { index in
-                    if keyboardNavigation { proxy.scrollTo(index, anchor: .center) }
-                }
+                    .font(.system(size: 14)).padding(.horizontal, 12).padding(.vertical, 11)
+                    .background(HarborStyle.surface, in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(searchFocused ? HarborStyle.accent.opacity(0.65) : Color.primary.opacity(0.10), lineWidth: 1))
+                    .padding(.horizontal, 18)
+                    HStack {
+                        Picker("历史视图", selection: $showFrequent) {
+                            Text("全部").tag(false)
+                            Text("常用").tag(true)
+                        }.pickerStyle(.segmented).labelsHidden().frame(width: 152, alignment: .leading)
+                        Spacer()
+                        Text("\(items.count) 条记录").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }.padding(.horizontal, 18).padding(.vertical, 12)
+                    if items.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: search.isEmpty ? "doc.on.clipboard" : "magnifyingglass")
+                                .font(.system(size: 30, weight: .light)).foregroundStyle(HarborStyle.accent.opacity(0.7))
+                            Text(!search.isEmpty ? "没有匹配的记录" : (showFrequent ? "暂无常用记录" : "暂无剪贴板记录"))
+                                .font(.system(size: 14, weight: .medium))
+                            Text(!search.isEmpty ? "换个关键词试试" : (showFrequent ? "通过这里粘贴后，常用内容会出现在此处" : (store.isPaused ? "继续记录后，复制的内容会出现在这里" : "复制一段文字或一张图片，从这里轻松找回")))
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 4) {
+                                    ForEach(Array(items.enumerated()), id: \.element) { index, item in
+                                        historyRow(item, index: index).id(item)
+                                    }
+                                }.padding(.horizontal, 10).padding(.bottom, 10)
+                            }
+                            .onChange(of: selectedIndex) { index in
+                                if keyboardNavigation, items.indices.contains(index) { proxy.scrollTo(items[index], anchor: .center) }
+                            }
+                        }
+                    }
+                    footer
                 }
             }
-            Divider()
-            HStack {
-                Button("微信聊天转上下文") { convert() }
-                Spacer()
-                Button(loginStatus == .enabled ? "✓ 登录时启动" : (loginStatus == .requiresApproval ? "取消启动（待授权）" : "登录时启动")) {
-                    do {
-                        loginStatus = SMAppService.mainApp.status
-                        if loginStatus == .enabled || loginStatus == .requiresApproval {
-                            try SMAppService.mainApp.unregister()
-                        } else {
-                            try SMAppService.mainApp.register()
-                        }
-                        loginStatus = SMAppService.mainApp.status
-                        if loginStatus == .requiresApproval {
-                            store.error = "请在系统设置 → 通用 → 登录项与扩展中允许 ClipHarbor。"
-                        }
-                    } catch {
-                        loginStatus = SMAppService.mainApp.status
-                        store.error = "无法更改登录时启动：\(error.localizedDescription)"
-                    }
-                }
-            }.padding(.horizontal, 12).padding(.top, 8)
-            HStack {
-                Button("清空未置顶") { confirmingClear = true }.disabled(store.history.items.count == store.history.pinned.count)
-                Spacer()
-                Menu("快捷键") {
-                    Picker("调出历史", selection: $shortcut) {
-                        Text("⌥⇧V").tag("optionShiftV")
-                        Text("⌃⌥V").tag("controlOptionV")
-                        Text("关闭").tag("disabled")
-                    }
-                }
-                Button("退出") { NSApplication.shared.terminate(nil) }
-            }.padding(12)
         }
-        }
-        }
-        .frame(width: 440, height: 520)
+        .frame(width: 460, height: 600)
+        .background(HarborStyle.canvas).tint(HarborStyle.accent)
         .background(HistoryKeys { key in
             guard previewItem == nil, !confirmingClear else { return false }
             switch key {
@@ -497,6 +530,9 @@ struct HistoryView: View {
             }
         })
         .onChange(of: items) { _ in selectedIndex = 0 }
+        .onReceive(store.$history) { history in
+            if let item = previewItem, !history.items.contains(item) { previewItem = nil; searchFocused = true }
+        }
         .onAppear { loginStatus = SMAppService.mainApp.status; searchFocused = true }
         .confirmationDialog("清空所有未置顶记录？", isPresented: $confirmingClear, titleVisibility: .visible) {
             Button("清空未置顶", role: .destructive) { store.clear() }
@@ -506,37 +542,180 @@ struct HistoryView: View {
             Button("好") { store.error = nil }
         } message: { Text(store.error ?? "") }
     }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 19, weight: .medium)).foregroundStyle(HarborStyle.accent)
+                .frame(width: 40, height: 40)
+                .background(HarborStyle.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("ClipHarbor").font(.system(size: 18, weight: .semibold))
+                Text(store.isPaused ? "记录已暂停" : "剪贴板历史").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { store.setPaused(!store.isPaused) } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: store.isPaused ? "play.fill" : "pause.fill").font(.system(size: 9))
+                    Text(store.isPaused ? "继续记录" : "正在记录").font(.system(size: 11, weight: .medium))
+                }.padding(.horizontal, 10).padding(.vertical, 7)
+                .foregroundStyle(store.isPaused ? Color.primary : HarborStyle.accent)
+                .background((store.isPaused ? Color.orange : HarborStyle.accent).opacity(0.09), in: Capsule())
+            }.buttonStyle(.plain)
+                .help(store.isPaused ? "继续记录剪贴板" : "暂停记录剪贴板")
+                .accessibilityLabel(store.isPaused ? "已暂停记录，继续记录" : "正在记录，暂停记录")
+        }.padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 16)
+    }
+
+    private func historyRow(_ item: Clip, index: Int) -> some View {
+        let presentation = textCache.presentation(for: item)
+        let pinned = store.history.pinned.contains(item)
+        return HStack(spacing: 4) {
+            Button { select(item, false) } label: {
+                HStack(spacing: 12) {
+                    Group {
+                        if let data = item.imageData.first, let image = NSImage(data: data) {
+                            Image(nsImage: image).resizable().scaledToFill()
+                        } else {
+                            Image(systemName: "doc.text").font(.system(size: 18, weight: .light))
+                                .foregroundStyle(HarborStyle.accent).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                    }
+                    .frame(width: 38, height: 40)
+                    .background(HarborStyle.surface, in: RoundedRectangle(cornerRadius: 7))
+                    .clipShape(RoundedRectangle(cornerRadius: 7)).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(presentation.label).font(.system(size: 13)).lineLimit(2).multilineTextAlignment(.leading)
+                        if pinned || showFrequent {
+                            HStack(spacing: 8) {
+                                if pinned { Text("已置顶").foregroundStyle(HarborStyle.accent) }
+                                if showFrequent { Text("粘贴 \(store.history.count(for: item)) 次").foregroundStyle(.secondary) }
+                            }.font(.system(size: 10))
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.leading, 10).padding(.vertical, 11).contentShape(Rectangle())
+            }.buttonStyle(.plain).help("点击粘贴到之前的应用")
+            Button { previewItem = item } label: {
+                Image(systemName: "eye").frame(width: 26, height: 30)
+            }.buttonStyle(.plain).foregroundStyle(.secondary).help("完整预览").accessibilityLabel("完整预览")
+            Button { store.togglePin(item) } label: {
+                Image(systemName: pinned ? "pin.fill" : "pin").frame(width: 26, height: 30)
+            }.buttonStyle(.plain).foregroundStyle(pinned ? HarborStyle.accent : Color.secondary)
+                .help(pinned ? "取消置顶" : "置顶").accessibilityLabel(pinned ? "取消置顶" : "置顶")
+            Menu {
+                Button("按原格式粘贴") { select(item, false) }
+                Button("以纯文本粘贴") { select(item, true) }.disabled(presentation.plainText == nil)
+                Divider()
+                Button("删除这条记录", role: .destructive) { store.delete(item) }
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 24, height: 30)
+            }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().foregroundStyle(.secondary)
+                .accessibilityLabel("记录操作").padding(.trailing, 7)
+        }
+        .background(index == selectedIndex ? HarborStyle.accent.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(index == selectedIndex ? HarborStyle.accent.opacity(0.22) : Color.clear, lineWidth: 1).allowsHitTesting(false))
+        .onHover { hovering in
+            if hovering { keyboardNavigation = false; selectedIndex = index }
+        }
+    }
+
+    private var footer: some View {
+        VStack(spacing: 0) {
+            Divider().padding(.horizontal, 18)
+            Button(action: convert) {
+                HStack(spacing: 10) {
+                    Image(systemName: "bubble.left.and.bubble.right").font(.system(size: 17)).foregroundStyle(HarborStyle.accent)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("微信聊天导出").font(.system(size: 12, weight: .medium)).foregroundStyle(.primary)
+                        Text("整理为 Markdown 与图片").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
+                }.padding(.horizontal, 18).padding(.vertical, 13).contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            HStack {
+                Text("↑ ↓ 选择    ↵ 粘贴").font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    Button(loginStatus == .enabled ? "✓ 登录时启动" : (loginStatus == .requiresApproval ? "取消启动（待授权）" : "登录时启动")) { toggleLogin() }
+                    Menu("快捷键") {
+                        Picker("调出历史", selection: $shortcut) {
+                            Text("⌥⇧V").tag("optionShiftV")
+                            Text("⌃⌥V").tag("controlOptionV")
+                            Text("关闭").tag("disabled")
+                        }.pickerStyle(.inline)
+                    }
+                    Divider()
+                    Button("清空未置顶…", role: .destructive) { confirmingClear = true }
+                        .disabled(store.history.items.count == store.history.pinned.count)
+                    Divider()
+                    Button("退出 ClipHarbor") { NSApplication.shared.terminate(nil) }
+                } label: {
+                    Image(systemName: "gearshape").font(.system(size: 12)).frame(width: 24, height: 22)
+                }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().accessibilityLabel("设置")
+            }.padding(.horizontal, 18).padding(.bottom, 10)
+        }
+    }
+
+    private func toggleLogin() {
+        do {
+            loginStatus = SMAppService.mainApp.status
+            if loginStatus == .enabled || loginStatus == .requiresApproval {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+            loginStatus = SMAppService.mainApp.status
+            if loginStatus == .requiresApproval {
+                store.error = "请在系统设置 → 通用 → 登录项与扩展中允许 ClipHarbor。"
+            }
+        } catch {
+            loginStatus = SMAppService.mainApp.status
+            store.error = "无法更改登录时启动：\(error.localizedDescription)"
+        }
+    }
 }
 
 private struct ClipPreview: View {
     let item: Clip
+    let text: String?
     let close: () -> Void
     let select: (Bool) -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Button(action: close) { Label("返回", systemImage: "chevron.left") }
-                Spacer()
-                Text("完整预览").font(.headline)
-                Spacer()
-            }
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if let text = item.plainText { Text(text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                    ForEach(Array(item.imageData.enumerated()), id: \.offset) { _, data in
-                        if let image = NSImage(data: data) { Image(nsImage: image).resizable().scaledToFit().accessibilityLabel("剪贴板图片") }
-                    }
-                    if item.plainText == nil && item.imageData.isEmpty { Text("此格式无法预览，可按原格式粘贴。").foregroundStyle(.secondary) }
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button(action: close) { Image(systemName: "chevron.left").frame(width: 30, height: 30) }
+                    .buttonStyle(.plain).foregroundStyle(HarborStyle.accent).accessibilityLabel("返回")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("完整预览").font(.system(size: 17, weight: .semibold))
+                    Text("查看内容，再选择粘贴方式").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            Divider()
-            HStack {
-                Button("按原格式粘贴") { select(false) }
-                Button("以纯文本粘贴") { select(true) }.disabled(item.plainText == nil)
+                Spacer()
+            }.padding(18)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if let text { Text(text).font(.system(size: 14)).lineSpacing(5).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    ForEach(Array(item.imageData.enumerated()), id: \.offset) { _, data in
+                        if let image = NSImage(data: data) {
+                            Image(nsImage: image).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: 8)).accessibilityLabel("剪贴板图片")
+                        }
+                    }
+                    if text == nil && item.imageData.isEmpty {
+                        Text("此格式无法预览，可按原格式粘贴。").foregroundStyle(.secondary)
+                    }
+                }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
             }
-        }.padding(12)
+            .background(HarborStyle.surface, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.primary.opacity(0.06), lineWidth: 1))
+            .padding(.horizontal, 18).frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack(spacing: 10) {
+                Button("以纯文本粘贴") { select(true) }.disabled(text == nil).buttonStyle(.bordered)
+                Spacer()
+                Button("按原格式粘贴") { select(false) }.buttonStyle(.borderedProminent)
+            }.controlSize(.large).padding(18)
+        }
     }
 }
 

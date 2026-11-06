@@ -3,9 +3,10 @@ import SwiftUI
 import Carbon
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let store = ClipboardStore()
     private let pasteController = PasteController()
+    private let exportSession = WeChatExportSession()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem!
     private var hotKey: EventHotKeyRef?
@@ -20,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggle)
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 440, height: 520)
+        popover.contentSize = NSSize(width: 460, height: 600)
         popover.contentViewController = NSHostingController(rootView: HistoryView(store: store, convert: { [weak self] in self?.showWeChatExport() }) { [weak self] item, plainText in
             guard let self else { return }
             self.popover.performClose(nil)
@@ -44,33 +45,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminationPending = true
         pasteController.cancelPendingPaste()
         popover.performClose(nil)
+        exportSession.isTerminating = true
+        exportSession.cancel()
         store.prepareToTerminate()
         Task { @MainActor in
-            var shouldQuit = await store.flush()
+            let cleanupFailure = await exportSession.cancelAndWait()
+            let historySaved = await store.flush()
+            var shouldQuit = historySaved && cleanupFailure == nil
             if !shouldQuit {
                 let alert = NSAlert()
-                alert.messageText = "历史记录尚未保存"
-                alert.informativeText = "\(store.storageStatus ?? "无法保存最后的修改。")\n留在应用中可重试保存；仍然退出会丢失尚未保存的修改。"
+                alert.messageText = cleanupFailure == nil ? "历史记录尚未保存" : "微信导出目录尚未清理"
+                var details: [String] = []
+                if let cleanupFailure {
+                    details.append("\(cleanupFailure)\n留在应用中可检查上述路径；仍然退出会保留这些未完成的结果。")
+                }
+                if !historySaved {
+                    details.append("\(store.storageStatus ?? "无法保存最后的修改。")\n留在应用中可重试保存；仍然退出会丢失尚未保存的修改。")
+                }
+                alert.informativeText = details.joined(separator: "\n\n")
                 alert.addButton(withTitle: "留在应用")
                 alert.addButton(withTitle: "仍然退出")
                 NSApp.activate(ignoringOtherApps: true)
                 shouldQuit = alert.runModal() == .alertSecondButtonReturn
             }
-            if !shouldQuit { store.cancelTermination() }
+            if !shouldQuit {
+                store.cancelTermination()
+                exportSession.isTerminating = false
+            }
             terminationPending = false
             sender.reply(toApplicationShouldTerminate: shouldQuit)
         }
         return .terminateLater
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === conversionWindow else { return }
+        exportSession.cancel()
+    }
+
     private func showWeChatExport() {
         popover.performClose(nil)
         if conversionWindow?.isVisible != true {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 480),
                                   styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-            window.title = "微信聊天转上下文"
+            window.title = "微信聊天导出"
             window.isReleasedWhenClosed = false
-            window.contentViewController = NSHostingController(rootView: WeChatView())
+            window.delegate = self
+            window.contentViewController = NSHostingController(rootView: WeChatView(exportSession: exportSession))
             window.center()
             conversionWindow = window
         }

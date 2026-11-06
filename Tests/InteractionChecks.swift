@@ -7,6 +7,23 @@ func runInteractionChecks() async {
     assert(text.contains("A & B 中文") && text.contains("第二\n行"))
     assert(!text.contains("hidden") && !text.contains("https://") && !text.contains("background"))
     assert(plainTextFromHTML("<p title='a > b'>Visible &lt;tag&gt;</p>") == "Visible <tag>")
+    let htmlRegressions: [(String, String)] = [
+        ("<p>1 < 2 and 3 > 0</p>", "1 < 2 and 3 > 0"),
+        ("<p>x<2 && y>3; &lt;keep&gt;</p>", "x<2 && y>3; <keep>"),
+        ("<pre>if ready:\n    run()\n    done()</pre>", "if ready:\n    run()\n    done()"),
+        ("<PRE title='a > b'><code>  if x &lt; 2:\n\twork()  </code></PRE>", "  if x < 2:\n\twork()  "),
+        ("<p>before</p><pre>  code()\n    next()</pre><p>after</p>", "before\n  code()\n    next()\nafter"),
+        ("<pre>  first</pre><pre>\tsecond</pre>", "  first\n\tsecond"),
+        ("<p>before</p><pre>\n  code()\n</pre><p>after</p>", "before\n  code()\nafter"),
+        ("<pre>  unfinished\n    code", "  unfinished\n    code"),
+        ("<table><tr><th>商品</th><th>数量</th></tr><tr><td>A</td><td>12</td></tr></table>", "商品\t数量\nA\t12"),
+        ("<!DOCTYPE html><html><body><p>Visible</p></body></html>", "Visible")
+    ]
+    for (source, expected) in htmlRegressions {
+        assert(plainTextFromHTML(source) == expected, "HTML conversion changed visible content: \(source)")
+        let clip = Clip.rich([[NSPasteboard.PasteboardType.html.rawValue: Data(source.utf8)]])
+        assert(clip.plainText == expected)
+    }
     let rich = Clip.rich([[NSPasteboard.PasteboardType.html.rawValue: Data(html.utf8)]])
     assert(rich.plainText == text && rich.previewLabel.contains("中文"))
     let utf16HTML = Clip.rich([[NSPasteboard.PasteboardType.html.rawValue: "<p>UTF16 中文</p>".data(using: .utf16)!]])
@@ -84,6 +101,30 @@ func runInteractionChecks() async {
     try? await Task.sleep(nanoseconds: 450_000_000)
     assert(store.history.count(for: original) == 1)
     assert(board.string(forType: .string) == "Plain paste" && board.data(forType: .html) == nil)
+
+    var extractions = 0
+    let cache = ClipTextCache(store: store) { item in
+        extractions += 1
+        return item.plainText
+    }
+    let firstPresentation = cache.presentation(for: original)
+    assert(firstPresentation.plainText == "Plain paste" && firstPresentation.label == "Plain paste")
+    assert(cache.presentation(for: original).label.localizedCaseInsensitiveContains("plain"))
+    assert(cache.presentation(for: original).plainText == firstPresentation.plainText)
+    assert(extractions == 1 && cache.cachedCount == 1, "Repeated row/search/preview access must reuse extracted text")
+    _ = cache.presentation(for: first)
+    _ = cache.presentation(for: second)
+    assert(cache.cachedCount == 3 && extractions == 3)
+    store.togglePin(original)
+    assert(cache.presentation(for: original).label == "Plain paste" && extractions == 3)
+    store.delete(first)
+    assert(cache.cachedCount == 2, "Deletion must purge cached text without waiting for a view update")
+    store.clear()
+    assert(cache.cachedCount == 1, "Clear must retain only pinned text")
+    store.delete(original)
+    assert(cache.cachedCount == 0)
+    _ = cache.presentation(for: original)
+    assert(cache.cachedCount == 0, "A stale preview must not re-cache a deleted record")
     await requireSaved(store)
-    print("Interaction checks passed: IME, HTML, image preview labels, paste races and original-item counts")
+    print("Interaction checks passed: IME, HTML, image preview labels, paste races, original-item counts and text cache lifecycle")
 }
